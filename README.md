@@ -1,52 +1,40 @@
 # OSRS GE Price Tracker
 
-A data pipeline that collects Old School RuneScape Grand Exchange price data
-to support flipping decisions: see the gap between instant-buy and
-instant-sell prices, track traded volumes to judge how fast items actually
-move, and account for GE buy limits — so you can decide which items are
-worth flipping.
+Collects Old School RuneScape Grand Exchange price data to support flipping
+decisions: instant-buy vs instant-sell gap, traded volume, GE buy limits.
 
 ## Architecture
 
-The database is built in layers, warehouse-style:
+Warehouse-style, two layers:
 
-- **`stg_rs07` (staging)** — raw landing zone for API data, no constraints
-  on purpose: staging accepts whatever the source sends, rules are applied
-  downstream. Two loading strategies, chosen per source type:
-  - `stg_rs07_items` — the item catalog. The API always returns the full
-    current state, so the table is **truncated and reloaded** every run.
-  - `stg_5_min_prices` — 5-minute price snapshots. The API only serves the
-    latest window, so the table is **append-only**: staging is the only
-    place price history can accumulate.
-- **`dm_rs07` (data mart)** — the modeled layer. The schema exists as a
-  placeholder; it will hold an SCD2 item dimension (tracking buy-limit
-  changes over time), a price fact table with a composite `(item_id, ts)`
-  primary key to make duplicate loads impossible, and views with the
-  business logic — flip margin after the 2% GE tax, volume filters, trends.
+- **`stg_rs07`** — raw landing zone, no constraints. Both tables
+  truncate-and-reload every run; history lives downstream in the fact
+  table, not in staging.
+- **`dm_rs07`** — modeled layer:
+  - `dim_items_scd` — SCD2 item dimension. Surrogate key `item_surr_id`,
+    business key `item_src_id`, `start_dt`/`end_dt` validity (`9999-12-31`
+    sentinel on current rows), partial unique index on
+    `item_src_id WHERE is_active` so buy-limit changes are versioned, not
+    overwritten.
+  - `fact_5m_prices` — one row per item per 5-min window. Unique
+    constraint + `ON CONFLICT DO NOTHING` makes reloads duplicate-safe.
+  - `DM_loading.sql` — hand-written SCD2 merge: close changed dim rows →
+    insert new/changed versions → load fact via lookup to the current dim
+    row.
 
 ## Data source
 
 [OSRS Wiki Real-time Prices API](https://prices.runescape.wiki/):
-`/mapping` for the item catalog, `/5m` for price snapshots. Requests carry
-a descriptive User-Agent, as the Wiki's API rules ask.
+`/mapping` (catalog), `/5m` (price snapshots). Descriptive User-Agent per
+their API rules.
 
 ## Status
 
-**Done:**
+**Done:** staging schema + loaders, `dm_rs07` schema (SCD2 dim + fact),
+SCD2 merge SQL, full pipeline tested end-to-end.
 
-- ✅ `stg_rs07` staging schema — rerunnable `schema.sql` with
-  least-privilege grants and a rollback smoke test
-- ✅ Item catalog loader — truncate-and-reload from `/mapping`
-- ✅ Price snapshot loader — append-only from `/5m`, history accumulating
-- ✅ `dm_rs07` schema created (placeholder, no tables yet)
-
-**Future:**
-
-- 📋 SCD2 item dimension in `dm_rs07`
-- 📋 Price fact table with `(item_id, ts)` primary key and
-  duplicate-safe loads
-- 📋 Views: flip margin after GE tax, volume filters, trends
-- 📋 Scheduled loading (every 5 minutes) and a data retention policy
+**Next:** mart views (flip margin after GE tax, volume filters, trends),
+scheduled loading every 5 min, fact retention policy.
 
 ## Stack
 
@@ -54,56 +42,42 @@ Python 3 (`requests`, `SQLAlchemy` + `psycopg2`), PostgreSQL.
 
 ## Setup
 
-1. Create the database and the loader role (one time, as a superuser —
-   pick your own password):
+```sql
+CREATE DATABASE rs07_ge_item_prices;
+CREATE ROLE osrs_script_user LOGIN PASSWORD '<your-password>';
+```
 
-   ```sql
-   CREATE DATABASE rs07_ge_item_prices;
-   CREATE ROLE osrs_script_user LOGIN PASSWORD '<your-password>';
-   ```
+Run `schema.sql` (rerunnable, least-privilege grants). Create
+`connections.py` next to the loader (not committed):
 
-2. Run `schema.sql` against the new database. It rebuilds the schemas from
-   scratch (rerunnable) and applies least-privilege grants for the loader
-   role — no CREATE or DROP rights.
+```python
+import os
+from sqlalchemy import create_engine
 
-3. Create `connections.py` next to the loader (not committed — it is
-   connection config):
+def get_engine():
+    return create_engine(
+        f"postgresql+psycopg2://osrs_script_user:"
+        f"{os.environ['PG_PASSWORD']}@localhost:5432/rs07_ge_item_prices",
+        pool_pre_ping=True,
+    )
+```
 
-   ```python
-   import os
-   from sqlalchemy import create_engine
+Set `PG_PASSWORD`, then:
 
-   def get_engine():
-       user = "osrs_script_user"
-       password = os.environ["PG_PASSWORD"]  # never hardcoded
-       host = "localhost"
-       port = 5432
-       database = "rs07_ge_item_prices"
+pip install requests sqlalchemy psycopg2-binary
 
-       return create_engine(
-           f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}",
-           pool_pre_ping=True,
-       )
-   ```
+python item_and_prices.py
 
-4. Set the `PG_PASSWORD` environment variable to the role's password.
+Each run reloads staging and runs the SCD2 merge into the data mart. Run
+on a schedule to accumulate price history.
 
-5. Install dependencies and run:
+## What I learned
 
-   ```
-   pip install requests sqlalchemy psycopg2-binary
-   python item_and_prices.py
-   ```
-
-   Each run reloads the item catalog and appends one 5-minute price
-   snapshot. Run it on a schedule (every 5 minutes) to accumulate history.
-
-## What I learned building this
-
-I built this to relearn SQL and learn Python APIs hands-on, with AI as a
-teacher and code reviewer — it defined the steps and reviewed my work, but
-did not write the code for me. Along the way I learned to read Python
-tracebacks properly, why staging tables load differently depending on the
-source (full-state vs windowed), why credentials never belong in committed
-files, and that a copy-pasted line you did not think about is still your
-bug.
+Built to relearn SQL and learn Python APIs hands-on, with AI as teacher and
+reviewer — it defined steps and reviewed code, never wrote it. Learned to
+read tracebacks properly, why full-state vs windowed sources load
+differently, why credentials stay out of committed files, and the sharpest
+one: I put `source_system`/`source_entity` into the fact table's unique
+key, then relabeled one mid-project — every historical price row got
+re-inserted as "new" because the constraint no longer saw them as
+duplicates. A constraint only protects the grain you actually encode.

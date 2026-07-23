@@ -100,9 +100,6 @@ def insert_items_to_stg(items_list):
 
 def insert_item_prices_to_stg(price_list):
     """Append one 5-minute price snapshot to staging.
-
-    No TRUNCATE on purpose: the source only serves the latest window,
-    so staging is the only place price history can accumulate.
     """
     if not price_list:
         return 0
@@ -115,6 +112,7 @@ def insert_item_prices_to_stg(price_list):
     """
     conn = get_engine().raw_connection()
     cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE stg_rs07.stg_5_min_prices;")
     cur.executemany(sql, price_list)
     conn.commit()
     rowcount = cur.rowcount
@@ -123,10 +121,20 @@ def insert_item_prices_to_stg(price_list):
     print(f"Loaded {rowcount} price rows into stg_rs07.stg_5_min_prices")
     return rowcount
 
+def dm_layer_load():
+    conn = get_engine().raw_connection()
+    cur = conn.cursor()
+    with open("DM_loading.sql") as f:
+        sql = f.read()
+    cur.execute(sql)
+    conn.commit()
+    conn.close()
+
 
 def main():
     insert_items_to_stg(get_items())
     insert_item_prices_to_stg(get_item_prices())
+    dm_layer_load()
 
 
 if __name__ == "__main__":
